@@ -1,17 +1,18 @@
 import io
-from datetime import date
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+import pycountry
 import requests
 import streamlit as st
-import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-# ---------------------------------------------------------
-# Page setup
-# ---------------------------------------------------------
+# =========================================================
+# PAGE SETUP
+# =========================================================
+
 st.set_page_config(
     page_title="Real Exchange Rate App",
     page_icon="🌍",
@@ -19,219 +20,310 @@ st.set_page_config(
 )
 
 st.title("🌍 Real Exchange Rate App")
-st.write(
+
+st.markdown(
     """
-    This app uses monthly IMF data to calculate the real exchange rate (RER)
-    between two countries.
-    
-    **Definition:**  
-    S(t) = units of Country 2 currency per one unit of Country 1 currency  
-    
-    RER(t) = S(t) × P1(t) / P2(t)
-    """
+This app uses monthly IMF Consumer Price Index (CPI) and exchange-rate data
+to calculate the real exchange rate between two countries/economies.
+
+**Definitions**
+
+- **S(t)** = units of Country 2 currency per one unit of Country 1 currency
+- **P1(t)** = CPI of Country 1
+- **P2(t)** = CPI of Country 2
+- **RER(t) = S(t) × P1(t) / P2(t)**
+- **RER\\*** = average RER over the user-selected valid sample
+- **Real Index(t) = 100 × RER(t) / RER\\***
+"""
 )
 
 
-# ---------------------------------------------------------
-# Country list
-# ISO-3 codes used by IMF
-# ---------------------------------------------------------
-COUNTRIES = {
-    "Argentina": "ARG",
-    "Australia": "AUS",
-    "Austria": "AUT",
-    "Belgium": "BEL",
-    "Brazil": "BRA",
-    "Canada": "CAN",
-    "Chile": "CHL",
-    "China": "CHN",
-    "Colombia": "COL",
-    "Croatia": "HRV",
-    "Czech Republic": "CZE",
-    "Denmark": "DNK",
-    "Egypt": "EGY",
-    "Euro Area": "G163",
-    "Finland": "FIN",
-    "France": "FRA",
-    "Germany": "DEU",
-    "Greece": "GRC",
-    "Hong Kong SAR": "HKG",
-    "Hungary": "HUN",
-    "Iceland": "ISL",
-    "India": "IND",
-    "Indonesia": "IDN",
-    "Ireland": "IRL",
-    "Israel": "ISR",
-    "Italy": "ITA",
-    "Japan": "JPN",
-    "Korea": "KOR",
-    "Malaysia": "MYS",
-    "Mexico": "MEX",
-    "Netherlands": "NLD",
-    "New Zealand": "NZL",
-    "Norway": "NOR",
-    "Pakistan": "PAK",
-    "Peru": "PER",
-    "Philippines": "PHL",
-    "Poland": "POL",
-    "Portugal": "PRT",
-    "Romania": "ROU",
-    "Saudi Arabia": "SAU",
-    "Singapore": "SGP",
-    "South Africa": "ZAF",
-    "Spain": "ESP",
-    "Sweden": "SWE",
-    "Switzerland": "CHE",
-    "Thailand": "THA",
-    "Türkiye": "TUR",
-    "United Kingdom": "GBR",
-    "United States": "USA",
+# =========================================================
+# COUNTRY / ECONOMY LIST
+# =========================================================
+#
+# pycountry supplies ISO-3 country/economy codes.
+# The IMF Euro Area code required by the assignment is G163.
+#
+# Some countries/economies may have incomplete CPI or FX coverage.
+# The app handles missing IMF series gracefully.
+# =========================================================
+
+DISPLAY_NAME_OVERRIDES = {
+    "BOL": "Bolivia",
+    "BRN": "Brunei",
+    "COD": "Democratic Republic of the Congo",
+    "COG": "Republic of the Congo",
+    "CZE": "Czech Republic",
+    "GBR": "United Kingdom",
+    "IRN": "Iran",
+    "KOR": "Korea",
+    "LAO": "Laos",
+    "MDA": "Moldova",
+    "PRK": "North Korea",
+    "RUS": "Russia",
+    "SYR": "Syria",
+    "TUR": "Türkiye",
+    "TZA": "Tanzania",
+    "USA": "United States",
+    "VEN": "Venezuela",
+    "VNM": "Vietnam",
 }
 
 
-# ---------------------------------------------------------
-# IMF API functions
-# ---------------------------------------------------------
-HEADERS = {
+def build_country_list():
+    country_map = {}
+
+    for country in pycountry.countries:
+        code = country.alpha_3
+        name = DISPLAY_NAME_OVERRIDES.get(code, country.name)
+        country_map[name] = code
+
+    # IMF code explicitly required by the assignment
+    country_map["Euro Area"] = "G163"
+
+    return dict(sorted(country_map.items()))
+
+
+COUNTRIES = build_country_list()
+
+
+# =========================================================
+# IMF API SETTINGS
+# =========================================================
+
+IMF_BASE_30 = "https://api.imf.org/external/sdmx/3.0"
+
+HEADERS_30 = {
     "Accept": "text/csv",
-    "User-Agent": "real-exchange-rate-streamlit-app/1.0",
+    "User-Agent": "real-exchange-rate-app/1.0",
 }
 
 
-def parse_imf_csv(response_text):
+# =========================================================
+# IMF DATA PARSING
+# =========================================================
+
+def parse_imf_csv(text):
     """
-    Parse IMF SDMX CSV output.
-    Returns a DataFrame with Date and Value.
+    Parse IMF SDMX CSV output and return:
+        Date
+        Value
     """
-    df = pd.read_csv(io.StringIO(response_text), low_memory=False)
+
+    if not text or len(text.strip()) == 0:
+        return pd.DataFrame(columns=["Date", "Value"])
+
+    df = pd.read_csv(
+        io.StringIO(text),
+        low_memory=False,
+    )
 
     if df.empty:
         return pd.DataFrame(columns=["Date", "Value"])
 
-    # IMF normally uses TIME_PERIOD and OBS_VALUE
     time_col = None
     value_col = None
 
     for col in df.columns:
         if col.upper() == "TIME_PERIOD":
             time_col = col
+
         if col.upper() == "OBS_VALUE":
             value_col = col
 
     if time_col is None or value_col is None:
         raise ValueError(
-            f"Could not identify TIME_PERIOD or OBS_VALUE. "
-            f"Returned columns: {list(df.columns)}"
+            "The IMF response did not contain TIME_PERIOD "
+            f"and OBS_VALUE. Returned columns: {list(df.columns)}"
         )
 
     result = df[[time_col, value_col]].copy()
-    result.columns = ["Date", "Value"]
 
-    # IMF monthly dates can appear as 2024-M01
+    result.columns = [
+        "Date",
+        "Value",
+    ]
+
+    # IMF monthly dates can appear as:
+    # 2024-M01
+    # or
+    # 2024-01
     result["Date"] = (
         result["Date"]
         .astype(str)
         .str.replace("-M", "-", regex=False)
     )
 
-    result["Date"] = pd.to_datetime(result["Date"], errors="coerce")
-    result["Value"] = pd.to_numeric(result["Value"], errors="coerce")
+    result["Date"] = pd.to_datetime(
+        result["Date"],
+        errors="coerce",
+    )
+
+    result["Value"] = pd.to_numeric(
+        result["Value"],
+        errors="coerce",
+    )
 
     result = (
         result
         .dropna(subset=["Date", "Value"])
         .drop_duplicates(subset=["Date"])
         .sort_values("Date")
+        .reset_index(drop=True)
+    )
+
+    # Force monthly observations to month-start dates
+    result["Date"] = (
+        result["Date"]
+        .dt.to_period("M")
+        .dt.to_timestamp()
     )
 
     return result
 
 
-@st.cache_data(ttl=3600)
-def fetch_imf_series(dataflow, key, start="1976-01"):
+# =========================================================
+# IMF API FETCH
+# =========================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_imf_series(dataflow, key):
     """
-    Try IMF SDMX 3.0 first.
-    If the public 3.0 endpoint is unavailable, fall back to IMF SDMX 2.1.
+    Retrieve monthly IMF data using the SDMX 3.0 API.
+
+    Primary query:
+        IMF SDMX 3.0
+
+    A 2.1 fallback is included only in case the live IMF
+    3.0 service temporarily rejects a request.
     """
 
-    # Current SDMX 3.0 endpoint
-    url_3 = (
-        f"https://api.imf.org/external/sdmx/3.0/data/"
+    start_period = "1976-01"
+
+    url_30 = (
+        f"{IMF_BASE_30}/data/"
         f"dataflow/IMF.STA/{dataflow}/~/{key}"
-        f"?c[TIME_PERIOD]=ge:{start}"
+        f"?c[TIME_PERIOD]=ge:{start_period}"
+    )
+
+    first_error = None
+
+    try:
+        response = requests.get(
+            url_30,
+            headers=HEADERS_30,
+            timeout=40,
+        )
+
+        response.raise_for_status()
+
+        parsed = parse_imf_csv(response.text)
+
+        if not parsed.empty:
+            return parsed
+
+        first_error = "SDMX 3.0 returned no observations."
+
+    except Exception as exc:
+        first_error = str(exc)
+
+    # -----------------------------------------------------
+    # Fallback
+    # -----------------------------------------------------
+
+    url_21 = (
+        "https://api.imf.org/external/sdmx/2.1/data/"
+        f"IMF.STA,{dataflow}/{key}"
+        f"?startPeriod={start_period}"
     )
 
     try:
-        r = requests.get(
-            url_3,
-            headers=HEADERS,
-            timeout=30,
+        response = requests.get(
+            url_21,
+            headers={
+                "Accept": (
+                    "application/vnd.sdmx.data+csv;"
+                    "version=1.0.0"
+                ),
+                "User-Agent": "real-exchange-rate-app/1.0",
+            },
+            timeout=40,
         )
 
-        if r.status_code == 200 and len(r.text) > 100:
-            result = parse_imf_csv(r.text)
+        response.raise_for_status()
 
-            if not result.empty:
-                return result
+        parsed = parse_imf_csv(response.text)
 
-    except Exception:
-        pass
+        if not parsed.empty:
+            return parsed
 
-    # Fallback to IMF SDMX 2.1
-    url_2 = (
-        f"https://api.imf.org/external/sdmx/2.1/data/"
-        f"IMF.STA,{dataflow}/{key}"
-        f"?startPeriod={start}"
+    except Exception as exc:
+        raise RuntimeError(
+            "IMF data download failed. "
+            f"SDMX 3.0 error: {first_error}. "
+            f"Fallback error: {exc}"
+        ) from exc
+
+    raise RuntimeError(
+        "The IMF returned no observations for this series. "
+        "The country/economy may have limited data coverage."
     )
 
-    r = requests.get(
-        url_2,
-        headers={
-            "Accept": "application/vnd.sdmx.data+csv;version=1.0.0",
-            "User-Agent": "real-exchange-rate-streamlit-app/1.0",
-        },
-        timeout=30,
-    )
 
-    r.raise_for_status()
+# =========================================================
+# CPI
+# =========================================================
 
-    result = parse_imf_csv(r.text)
-
-    if result.empty:
-        raise ValueError(
-            f"No IMF observations were returned for {key}."
-        )
-
-    return result
-
-
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_cpi(country_code):
     """
-    Monthly headline CPI index.
-    IMF key:
-    COUNTRY.CPI._T.IX.M
+    Monthly IMF CPI.
+
+    Assignment-required IMF key:
+        {ISO3}.CPI._T.IX.M
     """
+
     key = f"{country_code}.CPI._T.IX.M"
-    df = fetch_imf_series("CPI", key)
-    df = df.rename(columns={"Value": "CPI"})
+
+    df = fetch_imf_series(
+        dataflow="CPI",
+        key=key,
+    )
+
+    df = df.rename(
+        columns={
+            "Value": "CPI",
+        }
+    )
+
     return df
 
 
-@st.cache_data(ttl=3600)
+# =========================================================
+# EXCHANGE RATE
+# =========================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_fx(country_code):
     """
-    Monthly exchange rate:
-    units of local currency per USD.
-    IMF key:
-    COUNTRY.XDC_USD.PA_RT.M
+    Monthly IMF exchange rate.
+
+    Assignment-required IMF key:
+        {ISO3}.XDC_USD.PA_RT.M
+
+    IMF convention:
+        local currency units per USD.
     """
 
-    # USD per USD = 1 by definition
+    # USD per USD is exactly 1.
+    # We construct it directly so that the United States
+    # can be used cleanly as either Country 1 or Country 2.
     if country_code == "USA":
+
         dates = pd.date_range(
             start="1976-01-01",
-            end=pd.Timestamp.today(),
+            end=pd.Timestamp.today().to_period("M").to_timestamp(),
             freq="MS",
         )
 
@@ -243,210 +335,424 @@ def get_fx(country_code):
         )
 
     key = f"{country_code}.XDC_USD.PA_RT.M"
-    df = fetch_imf_series("ER", key)
-    df = df.rename(columns={"Value": "FX_per_USD"})
+
+    df = fetch_imf_series(
+        dataflow="ER",
+        key=key,
+    )
+
+    df = df.rename(
+        columns={
+            "Value": "FX_per_USD",
+        }
+    )
+
     return df
 
 
-# ---------------------------------------------------------
-# Sidebar inputs
-# ---------------------------------------------------------
+# =========================================================
+# SIDEBAR — COUNTRY SELECTION
+# =========================================================
+
 st.sidebar.header("Settings")
 
 country_names = list(COUNTRIES.keys())
 
-default_c1 = country_names.index("United Kingdom")
-default_c2 = country_names.index("United States")
+uk_index = country_names.index("United Kingdom")
+us_index = country_names.index("United States")
 
 country1_name = st.sidebar.selectbox(
     "Country 1",
-    country_names,
-    index=default_c1,
+    options=country_names,
+    index=uk_index,
 )
 
 country2_name = st.sidebar.selectbox(
     "Country 2",
-    country_names,
-    index=default_c2,
+    options=country_names,
+    index=us_index,
 )
 
-country1 = COUNTRIES[country1_name]
-country2 = COUNTRIES[country2_name]
+country1_code = COUNTRIES[country1_name]
+country2_code = COUNTRIES[country2_name]
+
+
+# =========================================================
+# CHART TYPE
+# =========================================================
 
 chart_type = st.sidebar.radio(
     "Chart",
-    ["Real", "Nominal", "Both"],
+    options=[
+        "Real",
+        "Nominal",
+        "Both",
+    ],
     index=2,
 )
 
-st.sidebar.markdown("---")
 st.sidebar.caption(
     "Data source: IMF SDMX API. "
     "Monthly CPI and period-average exchange rates."
 )
 
 
-# ---------------------------------------------------------
-# Load data
-# ---------------------------------------------------------
-if country1 == country2:
-    st.error("Please select two different countries.")
-    st.stop()
+# =========================================================
+# BASIC VALIDATION
+# =========================================================
 
-
-with st.spinner("Downloading IMF data..."):
-    try:
-        cpi1 = get_cpi(country1)
-        cpi2 = get_cpi(country2)
-
-        fx1 = get_fx(country1)
-        fx2 = get_fx(country2)
-
-    except Exception as e:
-        st.error(
-            "The IMF data could not be downloaded. "
-            "The selected country may have limited coverage, "
-            "or the IMF API may be temporarily unavailable."
-        )
-
-        st.code(str(e))
-        st.stop()
-
-
-# ---------------------------------------------------------
-# Merge data
-# ---------------------------------------------------------
-cpi1 = cpi1.rename(columns={"CPI": "P1"})
-cpi2 = cpi2.rename(columns={"CPI": "P2"})
-
-fx1 = fx1.rename(columns={"FX_per_USD": "FX1_per_USD"})
-fx2 = fx2.rename(columns={"FX_per_USD": "FX2_per_USD"})
-
-data = (
-    cpi1
-    .merge(cpi2, on="Date", how="inner")
-    .merge(fx1, on="Date", how="inner")
-    .merge(fx2, on="Date", how="inner")
-)
-
-data = data.sort_values("Date").dropna()
-
-if data.empty:
-    st.error(
-        "There are no overlapping CPI and exchange-rate observations "
-        "for the selected countries."
+if country1_code == country2_code:
+    st.warning(
+        "Please select two different countries/economies."
     )
     st.stop()
 
 
-# ---------------------------------------------------------
-# Economic calculations
-# ---------------------------------------------------------
+# =========================================================
+# DOWNLOAD IMF DATA
+# =========================================================
+
+with st.spinner("Downloading IMF data..."):
+
+    try:
+        cpi1 = get_cpi(country1_code)
+        cpi2 = get_cpi(country2_code)
+
+        fx1 = get_fx(country1_code)
+        fx2 = get_fx(country2_code)
+
+    except Exception as exc:
+
+        st.error(
+            "The required IMF data could not be downloaded "
+            "for this country combination."
+        )
+
+        st.info(
+            "IMF data can have gaps or limited historical coverage. "
+            "Try another country pair, or try again later."
+        )
+
+        with st.expander("Technical details"):
+            st.code(str(exc))
+
+        st.stop()
+
+
+# =========================================================
+# MERGE CPI AND FX DATA
+# =========================================================
+
+cpi1 = cpi1.rename(
+    columns={
+        "CPI": "P1",
+    }
+)
+
+cpi2 = cpi2.rename(
+    columns={
+        "CPI": "P2",
+    }
+)
+
+fx1 = fx1.rename(
+    columns={
+        "FX_per_USD": "FX1_per_USD",
+    }
+)
+
+fx2 = fx2.rename(
+    columns={
+        "FX_per_USD": "FX2_per_USD",
+    }
+)
+
+
+data = (
+    cpi1
+    .merge(
+        cpi2,
+        on="Date",
+        how="inner",
+    )
+    .merge(
+        fx1,
+        on="Date",
+        how="inner",
+    )
+    .merge(
+        fx2,
+        on="Date",
+        how="inner",
+    )
+)
+
+
+data = (
+    data
+    .replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    .dropna()
+    .sort_values("Date")
+    .reset_index(drop=True)
+)
+
+
+if data.empty:
+
+    st.error(
+        "There are no overlapping valid monthly CPI and "
+        "exchange-rate observations for this country pair."
+    )
+
+    st.stop()
+
+
+# =========================================================
+# ECONOMIC CALCULATIONS
+# =========================================================
 #
-# IMF FX data:
-# FX1 = Country 1 currency per USD
-# FX2 = Country 2 currency per USD
+# IMF gives:
 #
-# Required:
-# S = Country 2 currency per Country 1 currency
+# FX1 = Country 1 currency / USD
+# FX2 = Country 2 currency / USD
+#
+# Assignment requires:
+#
+# S = Country 2 currency / Country 1 currency
 #
 # Therefore:
+#
 # S = FX2 / FX1
 #
+#
 # Example:
-# UK Country 1, US Country 2:
-# FX1 = GBP/USD
-# FX2 = USD/USD = 1
 #
-# S = 1 / (GBP/USD) = USD/GBP
+# Country 1 = United Kingdom
+# Country 2 = United States
 #
+# FX1 = GBP / USD
+# FX2 = USD / USD = 1
+#
+# S = 1 / (GBP/USD)
+#   = USD / GBP
+#
+# This is exactly the direction required by the assignment.
+# =========================================================
 
-data["S"] = data["FX2_per_USD"] / data["FX1_per_USD"]
-
-# RER = S × P1 / P2
-data["RER"] = data["S"] * data["P1"] / data["P2"]
-
-
-# ---------------------------------------------------------
-# Date selector
-# ---------------------------------------------------------
-min_date = data["Date"].min().date()
-max_date = data["Date"].max().date()
-
-st.sidebar.markdown("### Sample period")
-
-start_date = st.sidebar.date_input(
-    "Start month",
-    value=min_date,
-    min_value=min_date,
-    max_value=max_date,
+data["S"] = (
+    data["FX2_per_USD"]
+    / data["FX1_per_USD"]
 )
 
-end_date = st.sidebar.date_input(
-    "End month",
-    value=max_date,
-    min_value=min_date,
-    max_value=max_date,
+
+# RER(t) = S(t) × P1(t) / P2(t)
+
+data["RER"] = (
+    data["S"]
+    * data["P1"]
+    / data["P2"]
 )
 
-if start_date > end_date:
-    st.error("Start date must be before end date.")
+
+data = (
+    data
+    .replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    .dropna(
+        subset=[
+            "P1",
+            "P2",
+            "FX1_per_USD",
+            "FX2_per_USD",
+            "S",
+            "RER",
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+
+if data.empty:
+
+    st.error(
+        "No valid observations remain after calculating the RER."
+    )
+
     st.stop()
+
+
+# =========================================================
+# MONTH SELECTION
+# =========================================================
+#
+# The assignment explicitly asks users to choose
+# START and END MONTHS.
+#
+# Therefore, use YYYY-MM values instead of daily date inputs.
+# =========================================================
+
+available_months = (
+    data["Date"]
+    .dt.strftime("%Y-%m")
+    .tolist()
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Sample period")
+
+start_month = st.sidebar.selectbox(
+    "Start month",
+    options=available_months,
+    index=0,
+)
+
+end_month = st.sidebar.selectbox(
+    "End month",
+    options=available_months,
+    index=len(available_months) - 1,
+)
+
+
+start_period = pd.Period(
+    start_month,
+    freq="M",
+)
+
+end_period = pd.Period(
+    end_month,
+    freq="M",
+)
+
+
+if start_period > end_period:
+
+    st.error(
+        "Start month must be earlier than or equal to end month."
+    )
+
+    st.stop()
+
+
+data["Month"] = data["Date"].dt.to_period("M")
 
 
 sample = data[
-    (data["Date"].dt.date >= start_date)
-    & (data["Date"].dt.date <= end_date)
+    (data["Month"] >= start_period)
+    & (data["Month"] <= end_period)
 ].copy()
 
+
 if sample.empty:
-    st.error("No valid observations exist in the selected period.")
+
+    st.error(
+        "No valid observations exist in the selected sample period."
+    )
+
     st.stop()
 
 
-# ---------------------------------------------------------
-# Recalculate RER* whenever selected dates change
-# ---------------------------------------------------------
+# =========================================================
+# RER* AND REAL INDEX
+# =========================================================
+#
+# IMPORTANT:
+# RER* must be recalculated every time start/end months change.
+# =========================================================
+
 rer_star = sample["RER"].mean()
 
-sample["Real_Index"] = 100 * sample["RER"] / rer_star
+
+if pd.isna(rer_star) or rer_star == 0:
+
+    st.error(
+        "RER* could not be calculated for this sample."
+    )
+
+    st.stop()
 
 
-# ---------------------------------------------------------
-# Summary
-# ---------------------------------------------------------
+sample["RER_star"] = rer_star
+
+
+sample["Real_Index"] = (
+    100
+    * sample["RER"]
+    / sample["RER_star"]
+)
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+
 st.subheader(
     f"{country1_name} vs. {country2_name}"
 )
 
-st.write(
+
+st.markdown(
     f"""
-    **Nominal exchange rate S:**  
-    {country2_name} currency per one unit of {country1_name} currency.
-    """
+**Nominal exchange-rate convention**
+
+**S(t) = {country2_name} currency per one unit of {country1_name} currency**
+
+The nominal exchange rate shown below is in actual currency units
+and is **not normalized**.
+"""
 )
 
-col1, col2, col3 = st.columns(3)
+
+col1, col2, col3, col4 = st.columns(4)
+
 
 col1.metric(
-    "RER* (sample average)",
-    f"{rer_star:.4f}",
+    "RER*",
+    f"{rer_star:.6f}",
 )
+
 
 col2.metric(
     "Average Real Index",
-    f"{sample['Real_Index'].mean():.2f}",
+    f"{sample['Real_Index'].mean():.4f}",
 )
 
+
 col3.metric(
-    "Valid monthly observations",
+    "Valid months",
     f"{len(sample):,}",
 )
 
 
-# ---------------------------------------------------------
-# Charts
-# ---------------------------------------------------------
+col4.metric(
+    "Latest nominal S",
+    f"{sample['S'].iloc[-1]:.6f}",
+)
+
+
+# =========================================================
+# SPECIAL UK / US CHECK
+# =========================================================
+
+if (
+    country1_code == "GBR"
+    and country2_code == "USA"
+):
+
+    st.success(
+        "UK–U.S. direction check passed: "
+        "S is expressed as USD per GBP."
+    )
+
+
+# =========================================================
+# INTERACTIVE CHARTS
+# =========================================================
+
 if chart_type == "Real":
 
     fig = go.Figure()
@@ -463,7 +769,7 @@ if chart_type == "Real":
     fig.add_hline(
         y=100,
         line_dash="dash",
-        annotation_text="Sample average = 100",
+        annotation_text="RER* benchmark = 100",
     )
 
     fig.update_layout(
@@ -471,11 +777,6 @@ if chart_type == "Real":
         xaxis_title="Date",
         yaxis_title="Real Index",
         hovermode="x unified",
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
     )
 
 
@@ -497,21 +798,22 @@ elif chart_type == "Nominal":
         xaxis_title="Date",
         yaxis_title=(
             f"{country2_name} currency "
-            f"per {country1_name} currency"
+            f"per one unit of {country1_name} currency"
         ),
         hovermode="x unified",
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
     )
 
 
 else:
 
     fig = make_subplots(
-        specs=[[{"secondary_y": True}]]
+        specs=[
+            [
+                {
+                    "secondary_y": True,
+                }
+            ]
+        ]
     )
 
     fig.add_trace(
@@ -537,7 +839,6 @@ else:
     fig.add_hline(
         y=100,
         line_dash="dash",
-        secondary_y=False,
     )
 
     fig.update_layout(
@@ -559,16 +860,19 @@ else:
         secondary_y=True,
     )
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-    )
+
+st.plotly_chart(
+    fig,
+    use_container_width=True,
+)
 
 
-# ---------------------------------------------------------
-# Data table
-# ---------------------------------------------------------
-st.subheader("Data")
+# =========================================================
+# DATA TABLE
+# =========================================================
+
+st.subheader("Selected Sample Data")
+
 
 output = sample[
     [
@@ -579,71 +883,172 @@ output = sample[
         "FX2_per_USD",
         "S",
         "RER",
+        "RER_star",
         "Real_Index",
     ]
 ].copy()
 
+
 output.columns = [
     "Date",
-    f"CPI_{country1}",
-    f"CPI_{country2}",
-    f"{country1}_currency_per_USD",
-    f"{country2}_currency_per_USD",
+    f"CPI_{country1_code}",
+    f"CPI_{country2_code}",
+    f"{country1_code}_currency_per_USD",
+    f"{country2_code}_currency_per_USD",
     "Nominal_S",
     "RER",
+    "RER_star",
     "Real_Index",
 ]
 
-output["Date"] = output["Date"].dt.strftime("%Y-%m")
+
+output["Date"] = (
+    output["Date"]
+    .dt.strftime("%Y-%m")
+)
+
 
 st.dataframe(
     output,
     use_container_width=True,
+    hide_index=True,
 )
 
 
-# ---------------------------------------------------------
-# CSV download
-# ---------------------------------------------------------
-csv = output.to_csv(
-    index=False
+# =========================================================
+# CSV DOWNLOAD
+# =========================================================
+
+csv_data = output.to_csv(
+    index=False,
 ).encode("utf-8")
+
 
 st.download_button(
     label="⬇️ Download CSV",
-    data=csv,
+    data=csv_data,
     file_name=(
-        f"rer_{country1}_{country2}_"
-        f"{start_date}_{end_date}.csv"
+        f"real_exchange_rate_"
+        f"{country1_code}_"
+        f"{country2_code}_"
+        f"{start_month}_"
+        f"{end_month}.csv"
     ),
     mime="text/csv",
 )
 
 
-# ---------------------------------------------------------
-# Manual verification section
-# ---------------------------------------------------------
+# =========================================================
+# MANUAL RER VERIFICATION
+# =========================================================
+
 st.subheader("Manual RER Verification")
 
-last_row = sample.iloc[-1]
 
-st.write(
+verification_row = sample.iloc[-1]
+
+
+verification_month = (
+    verification_row["Date"]
+    .strftime("%Y-%m")
+)
+
+
+st.markdown(
     f"""
-    For **{last_row['Date'].strftime('%Y-%m')}**:
+For **{verification_month}**:
 
-    - P1 = {last_row['P1']:.4f}
-    - P2 = {last_row['P2']:.4f}
-    - S = {last_row['S']:.6f}
+- P1 = **{verification_row['P1']:.6f}**
+- P2 = **{verification_row['P2']:.6f}**
+- S = **{verification_row['S']:.6f}**
 
-    **RER = S × P1 / P2**
+Using:
 
-    = {last_row['S']:.6f} × {last_row['P1']:.4f} / {last_row['P2']:.4f}
+**RER = S × P1 / P2**
 
-    = **{last_row['RER']:.6f}**
-    """
+Calculation:
+
+**{verification_row['S']:.6f}
+× {verification_row['P1']:.6f}
+÷ {verification_row['P2']:.6f}
+= {verification_row['RER']:.6f}**
+"""
 )
 
-st.caption(
-    "Real Index is normalized so that its average equals 100 "
-    "over the selected sample period."
+
+# =========================================================
+# VALIDATION CHECKS
+# =========================================================
+
+st.subheader("Validation Checks")
+
+
+average_real_index = sample["Real_Index"].mean()
+
+
+check1 = np.isclose(
+    average_real_index,
+    100.0,
+    atol=1e-8,
 )
+
+
+manual_rer = (
+    verification_row["S"]
+    * verification_row["P1"]
+    / verification_row["P2"]
+)
+
+
+check2 = np.isclose(
+    manual_rer,
+    verification_row["RER"],
+    rtol=1e-10,
+    atol=1e-10,
+)
+
+
+if check1:
+    st.success(
+        f"Real Index average check passed: "
+        f"{average_real_index:.6f}"
+    )
+else:
+    st.error(
+        f"Real Index average check failed: "
+        f"{average_real_index:.6f}"
+    )
+
+
+if check2:
+    st.success(
+        "Manual RER formula check passed."
+    )
+else:
+    st.error(
+        "Manual RER formula check failed."
+    )
+
+
+# =========================================================
+# DATA NOTES
+# =========================================================
+
+with st.expander("Data and methodology notes"):
+
+    st.markdown(
+        """
+- Data source: IMF SDMX API.
+- CPI key: `{ISO3}.CPI._T.IX.M`
+- Exchange-rate key: `{ISO3}.XDC_USD.PA_RT.M`
+- Euro Area IMF code: `G163`.
+- IMF exchange rates are local-currency units per USD.
+- Therefore, `S = FX2_per_USD / FX1_per_USD`.
+- Only months with valid observations for both CPI series and
+  both exchange-rate series are retained.
+- Data availability may vary across countries and over time.
+- RER* is recalculated whenever the selected sample changes.
+- The nominal exchange rate is displayed in actual currency
+  units and is never normalized.
+"""
+    )
